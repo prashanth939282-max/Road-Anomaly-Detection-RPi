@@ -21,10 +21,10 @@ An Edge AI application for the Raspberry Pi 4 designed to detect road anomalies 
    - [cite_start]**Snapshots**: High-confidence detection images are saved as evidence[cite: 664, 665].
 
 ## 📂 Project Structure
-- [cite_start]`/models`: Contains `.tflite` model files.
+- [cite_start]`/models`: Contains `.pt` model files.
 - [cite_start]`/scripts`: Main Python application logic and utilities[cite: 663, 665].
 - [cite_start]`/data`: Evidence snapshots of detected anomalies.
 - [cite_start]`/logs`: CSV files recording detection history[cite: 663].
 
 ## 📅 Target Deadline
-- [cite_start]**Submission Date**: February 15, 2026[cite: 646].
+- [cite_start]**Submission Date**: February 20, 2026[cite: 646].
