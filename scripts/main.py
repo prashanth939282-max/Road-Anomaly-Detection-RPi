@@ -6,172 +6,210 @@ import time
 import csv
 import numpy as np
 from datetime import datetime
+from collections import deque
 
 # ==========================================
-# 1. HARDWARE & TESTING CONFIGURATION
+# 1. SYSTEM & DIRECTORY CONFIGURATION
 # ==========================================
-# SIMULATION_MODE: Set to True to test on PC without the .tflite model file
-SIMULATION_MODE = True 
-
-try:
-    from tflite_runtime.interpreter import Interpreter
-except ImportError:
-    from tensorflow.lite.python.interpreter import Interpreter
-
+# Toggle between live hardware deployment and PC-based testing
+SIMULATION_MODE = True  
 MODEL_PATH = "../models/road_model_quantized.tflite"
 LOG_PATH = "../logs/road_anomalies.csv"            
-DATA_DIR = "../data/snapshots"                     
-UDP_PORT = 5000                                    
-CONFIDENCE_MIN = 0.5                               
+DATA_DIR = "../data/snapshots"   
+VIDEO_DIR = "../data/video_clips" 
+
+# Detection and Logging parameters
+CONFIDENCE_MIN = 0.6       
+LOG_COOLDOWN = 5.0         # Prevention of duplicate logs for the same anomaly
+VIDEO_BUFFER_SEC = 3       # Pre-detection footage duration
+FPS_ESTIMATE = 10          # Targeted frame rate for video assembly
 
 # ==========================================
-# 2. GLOBAL STATE & THREAD SAFETY
+# 2. GLOBAL STATE & CONCURRENCY CONTROL
 # ==========================================
+# Lock ensures thread-safe access to shared variables
 state_lock = threading.Lock()
 current_gps = {"lat": "0.0000", "lon": "0.0000", "active": False}
+system_stats = {"cpu_temp": "N/A"}
+
+# Ring buffer to store the most recent frames in memory
+video_buffer = deque(maxlen=VIDEO_BUFFER_SEC * FPS_ESTIMATE)
 
 def gps_listener():
     """
-    Background Thread: Listens for 'lat,lon' UDP packets.
-    Works with gps_sim.py or a phone app.
+    Background listener for GPS coordinates sent via UDP.
+    Updates the global state when a valid 'lat,lon' string is received.
     """
     global current_gps
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
     try:
-        # Binding to 0.0.0.0 allows receiving from localhost AND external devices (phone)
-        sock.bind(("0.0.0.0", UDP_PORT))
-        print(f"[GPS] Socket bound to port {UDP_PORT}")
-        
+        sock.bind(("0.0.0.0", 5000))
         while True:
             data, _ = sock.recvfrom(1024)
-            raw_msg = data.decode('utf-8').strip()
-            
-            if "," in raw_msg:
-                parts = raw_msg.split(",")
-                if len(parts) >= 2:
-                    with state_lock:
-                        current_gps["lat"] = parts[0].strip()
-                        current_gps["lon"] = parts[1].strip()
-                        current_gps["active"] = True
-    except Exception as e:
-        print(f"[GPS ERROR] {e}")
+            parts = data.decode('utf-8').strip().split(",")
+            if len(parts) >= 2:
+                with state_lock:
+                    current_gps["lat"], current_gps["lon"] = parts[0], parts[1]
+                    current_gps["active"] = True
+    except: pass
+
+def hardware_monitor():
+    """
+    Continuous check of system temperature.
+    Reads from the Raspberry Pi thermal zone or defaults to PC mode.
+    """
+    global system_stats
+    while True:
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
+                temp = int(f.read()) / 1000.0
+                with state_lock:
+                    system_stats["cpu_temp"] = f"{temp:.1f}C"
+        except:
+            with state_lock: system_stats["cpu_temp"] = "PC-Mode"
+        time.sleep(5)
 
 # ==========================================
-# 3. STORAGE LOGIC
+# 3. DATA PERSISTENCE & VIDEO EXPORT
 # ==========================================
-def initialize_system():
-    """Creates folders and the CSV log file if missing."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs("../logs", exist_ok=True)
+def save_video_clip(frames_to_save, filename):
+    """
+    Writes a list of frames to an AVI file.
+    Executed in a separate thread to avoid blocking the main vision pipeline.
+    """
+    if not frames_to_save: return
     
+    h, w, _ = frames_to_save[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+    out = cv2.VideoWriter(os.path.join(VIDEO_DIR, filename), fourcc, 10.0, (w, h))
+    
+    for f in frames_to_save:
+        out.write(f)
+    out.release()
+
+def initialize_system():
+    """
+    Verified required directories exist and initializes the CSV log file 
+    with standard headers if it is not already present.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(VIDEO_DIR, exist_ok=True)
+    os.makedirs("../logs", exist_ok=True)
     if not os.path.exists(LOG_PATH):
         with open(LOG_PATH, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["Timestamp", "Anomaly_Type", "Conf", "Latitude", "Longitude", "Image_File"])
-        print("[SYSTEM] Folders and CSV ready.")
-
-def save_anomaly_data(frame, label, score):
-    """Saves image and appends a row to the CSV log."""
-    now = datetime.now()
-    img_name = f"road_{now.strftime('%H%M%S_%f')}.jpg"
-    img_save_path = os.path.join(DATA_DIR, img_name)
-    
-    # Save the current camera frame as a JPG
-    cv2.imwrite(img_save_path, frame)
-    
-    with state_lock:
-        lat, lon = current_gps["lat"], current_gps["lon"]
-
-    # Open CSV in 'append' mode to keep previous logs
-    with open(LOG_PATH, 'a', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([now.isoformat(), label, f"{score:.2f}", lat, lon, img_name])
-    
-    print(f"\n[DETECTED] {label} at {lat}, {lon} (Saved: {img_name})")
+            writer.writerow(["Timestamp", "Type", "Conf", "Lat", "Lon", "Img_File", "Vid_File"])
 
 # ==========================================
-# 4. ENGINE
+# 4. AI INFERENCE WRAPPER
+# ==========================================
+def process_inference(interpreter, frame, input_size):
+    """
+    Performs image preprocessing and executes the TFLite model.
+    Returns the maximum confidence score detected in the current frame.
+    """
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb, (input_size, input_size))
+    input_data = np.expand_dims(img_resized, axis=0)
+
+    # Handle float32 vs uint8 (quantized) models
+    if interpreter.get_input_details()[0]['dtype'] == np.float32:
+        input_data = (input_data / 255.0).astype(np.float32)
+    
+    interpreter.set_tensor(interpreter.get_input_details()[0]['index'], input_data)
+    interpreter.invoke()
+    output = interpreter.get_tensor(interpreter.get_output_details()[0]['index'])
+    return np.max(output) 
+
+# ==========================================
+# 5. MAIN PROCESSING LOOP
 # ==========================================
 def main_loop():
     initialize_system()
+    last_log_time = 0
     
+    # Interpreter initialization logic
     interpreter = None
-    input_size = 320 # Default fallback
-    
-    # Only try to load the model if NOT in simulation mode
+    input_size = 320
     if not SIMULATION_MODE:
         try:
+            from tflite_runtime.interpreter import Interpreter
             interpreter = Interpreter(model_path=MODEL_PATH)
             interpreter.allocate_tensors()
-            input_details = interpreter.get_input_details()
-            input_size = input_details[0]['shape'][1]
-            print(f"[AI] Model loaded. Input size: {input_size}")
+            input_size = interpreter.get_input_details()[0]['shape'][1]
         except Exception as e:
-            print(f"[AI ERROR] Model failed to load: {e}")
+            print(f"Inference Initialization Error: {e}")
             return
-    else:
-        print("[TEST MODE] AI Model is disabled. Simulating detections...")
 
-    cap = cv2.VideoCapture(0) # Use 0 for laptop webcam
+    # Video stream configuration
+    cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    last_sim_time = time.time()
 
     while cap.isOpened():
-        start_time = time.time()
         ret, frame = cap.read()
         if not ret: break
-
-        # --- DETECTION PHASE ---
-        max_conf = 0.0
         
+        # Add current frame to the pre-detection buffer
+        video_buffer.append(frame.copy())
+        
+        # Step 1: Execute Detection
+        confidence = 0.0
         if SIMULATION_MODE:
-            # Randomly "detect" a pothole every 7 seconds for testing logs
-            if time.time() - last_sim_time > 7.0:
-                max_conf = 0.95
-                last_sim_time = time.time()
+            # Manual trigger for debugging purposes
+            if cv2.waitKey(1) & 0xFF == ord('s'): confidence = 0.99
         else:
-            # REAL AI INFERENCE CODE
-            img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img_resized = cv2.resize(img_rgb, (input_size, input_size))
-            input_data = np.expand_dims(img_resized, axis=0)
+            confidence = process_inference(interpreter, frame, input_size)
+
+        # Step 2: Anomaly Event Handling
+        current_time = time.time()
+        if confidence > CONFIDENCE_MIN and (current_time - last_log_time) > LOG_COOLDOWN:
+            now = datetime.now()
+            file_stamp = now.strftime('%H%M%S')
+            img_name = f"img_{file_stamp}.jpg"
+            vid_name = f"clip_{file_stamp}.avi"
             
-            # Check model type
-            if interpreter.get_input_details()[0]['dtype'] == np.uint8:
-                input_data = input_data.astype(np.uint8)
-            else:
-                input_data = (input_data / 255.0).astype(np.float32)
+            # Save static image snapshot
+            cv2.imwrite(os.path.join(DATA_DIR, img_name), frame)
+            
+            # Initiate background video writing of the stored buffer
+            frames_to_write = list(video_buffer)
+            threading.Thread(target=save_video_clip, args=(frames_to_write, vid_name)).start()
+            
+            # Capture current GPS coordinates
+            with state_lock:
+                lat, lon = current_gps["lat"], current_gps["lon"]
+            
+            # Append entry to central log file
+            with open(LOG_PATH, 'a', newline='') as f:
+                csv.writer(f).writerow([now.isoformat(), "Pothole", f"{confidence:.2f}", lat, lon, img_name, vid_name])
+            
+            last_log_time = current_time
+            print(f"[EVENT] Detection recorded at {lat}, {lon}")
 
-            interpreter.set_tensor(interpreter.get_input_details()[0]['index'], input_data)
-            interpreter.invoke()
-            output = interpreter.get_tensor(interpreter.get_output_details()[0]['index'])
-            max_conf = np.max(output)
-
-        # --- LOGGING PHASE ---
-        if max_conf > CONFIDENCE_MIN:
-            save_anomaly_data(frame, "Pothole", max_conf)
-
-        # --- UI PHASE ---
-        fps = 1.0 / (time.time() - start_time)
+        # Step 3: Heads-Up Display (HUD)
         with state_lock:
-            gps_disp = f"GPS: {current_gps['lat']}, {current_gps['lon']}"
-            gps_active = current_gps["active"]
+            temp = system_stats["cpu_temp"]
+            gps_str = f"GPS: {current_gps['lat']}, {current_gps['lon']}"
+            gps_col = (0, 255, 0) if current_gps["active"] else (0, 0, 255)
 
-        # Visual overlays
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.putText(frame, gps_disp, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if gps_active else (0, 0, 255), 2)
-        if SIMULATION_MODE:
-            cv2.putText(frame, "SIMULATION ACTIVE", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+        # Draw overlays on the frame
+        cv2.putText(frame, f"TEMP: {temp}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, gps_str, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, gps_col, 2)
+        
+        # Visual notification for detection event
+        if (current_time - last_log_time) < 1.0:
+            cv2.rectangle(frame, (0,0), (640,480), (0, 0, 255), 10) 
 
-        cv2.imshow("Road Edge AI Debugger", frame)
+        cv2.imshow("Road Anomaly Edge AI", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'): break
 
+    # Resource release
     cap.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    t = threading.Thread(target=gps_listener, daemon=True)
-    t.start()
+    # Launch parallel tasks for GPS and Hardware monitoring
+    threading.Thread(target=gps_listener, daemon=True).start()
+    threading.Thread(target=hardware_monitor, daemon=True).start()
     main_loop()
